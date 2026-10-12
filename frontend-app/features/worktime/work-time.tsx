@@ -1,0 +1,2 @@
+export interface WorkLog { startedAt: string; endedAt?: string }
+export const workMinutes = (log: WorkLog) => Math.max(0, Math.round((new Date(log.endedAt || Date.now()).getTime() - new Date(log.startedAt).getTime()) / 60000))

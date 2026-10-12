@@ -1,0 +1,3 @@
+export interface SalesSnapshot { revenue: number; activeDeals: number; conversion: number }
+export const formatCurrency = (value: number) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(value)
+export const weightedPipeline = (deals: Array<{ value: number; probability: number }>) => deals.reduce((sum, deal) => sum + deal.value * deal.probability / 100, 0)

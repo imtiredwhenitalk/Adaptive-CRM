@@ -1,0 +1,2 @@
+import type { WorkLog } from './work-time'
+export const workSummary = (logs: WorkLog[]) => logs.reduce((sum, log) => sum + (log.endedAt ? Math.max(0, (new Date(log.endedAt).getTime() - new Date(log.startedAt).getTime()) / 60000) : 0), 0)

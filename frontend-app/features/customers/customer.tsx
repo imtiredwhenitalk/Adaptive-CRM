@@ -1,0 +1,2 @@
+export interface Customer { id: number; name: string; company: string; email: string; score: number }
+export const customerSearch = (customers: Customer[], query: string) => customers.filter(customer => `${customer.name} ${customer.company} ${customer.email}`.toLowerCase().includes(query.toLowerCase()))

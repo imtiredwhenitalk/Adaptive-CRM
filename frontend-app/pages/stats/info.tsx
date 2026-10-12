@@ -1,0 +1,1 @@
+export const metricDescription = (name: string, value: number) => `${name}: ${value.toLocaleString('uk-UA')}`

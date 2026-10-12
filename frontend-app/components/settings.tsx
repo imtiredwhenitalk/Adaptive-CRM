@@ -1,0 +1,2 @@
+export interface WorkspaceSettings { name: string; timezone: string; notifications: boolean; twoFactor: boolean }
+export const defaultSettings: WorkspaceSettings = { name: 'Orbit Studio', timezone: 'Europe/Kyiv', notifications: true, twoFactor: false }

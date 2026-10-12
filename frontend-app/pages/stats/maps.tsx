@@ -1,0 +1,2 @@
+export interface MapPoint { label: string; latitude: number; longitude: number; value: number }
+export const topLocations = (points: MapPoint[], limit = 5) => [...points].sort((a, b) => b.value - a.value).slice(0, limit)

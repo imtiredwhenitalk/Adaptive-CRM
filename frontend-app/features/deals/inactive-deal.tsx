@@ -1,0 +1,2 @@
+import type { Deal } from './deal'
+export const inactiveDeals = (deals: Array<Deal & { updatedAt?: string }>, days = 7) => deals.filter(deal => deal.updatedAt && Date.now() - new Date(deal.updatedAt).getTime() > days * 86400000)
