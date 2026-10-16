@@ -16,6 +16,10 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL })
 const port = Number(process.env.PORT || 4000)
 const sessionDays = 30
 const authCookie = 'adaptive_session'
+const oauthStateTtlMs = 10 * 60 * 1000
+const allowedDomains = (process.env.ALLOWED_EMAIL_DOMAINS || 'company.com').split(',').map(domain => domain.trim().toLowerCase()).filter(Boolean)
+const passwordLoginEnabled = process.env.PASSWORD_LOGIN_ENABLED === 'true'
+const oauthStates = new Map<string, { provider: 'google' | 'microsoft'; expiresAt: number }>()
 
 app.use(cors({ origin: process.env.WEB_ORIGIN || 'http://localhost:8080', credentials: true }))
 app.use(express.json({ limit: '64kb' }))
@@ -42,7 +46,94 @@ app.get('/health', async (_req, res) => {
   res.json({ status: 'ok' })
 })
 
+function isAllowedCorporateEmail(email: string) {
+  const domain = email.trim().toLowerCase().split('@').pop()
+  return Boolean(domain && allowedDomains.includes(domain))
+}
+
+function createOAuthState(provider: 'google' | 'microsoft') {
+  const state = crypto.randomBytes(32).toString('hex')
+  oauthStates.set(state, { provider, expiresAt: Date.now() + oauthStateTtlMs })
+  return state
+}
+
+function consumeOAuthState(state: string, provider: 'google' | 'microsoft') {
+  const record = oauthStates.get(state)
+  oauthStates.delete(state)
+  return record?.provider === provider && record.expiresAt > Date.now()
+}
+
+async function createSession(userId: string, res: Response) {
+  const token = crypto.randomBytes(32).toString('hex')
+  await pool.query("INSERT INTO sessions (token, user_id, expires_at) VALUES ($1, $2, now() + interval '30 days')", [token, userId])
+  res.cookie(authCookie, token, { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production', maxAge: sessionDays * 86400000 })
+}
+
+function oauthConfiguration(provider: 'google' | 'microsoft') {
+  if (provider === 'google') return {
+    clientId: process.env.GOOGLE_CLIENT_ID,
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+    authorizationEndpoint: 'https://accounts.google.com/o/oauth2/v2/auth',
+    tokenEndpoint: 'https://oauth2.googleapis.com/token',
+    redirectUri: process.env.GOOGLE_REDIRECT_URI || 'http://localhost:4000/api/auth/oauth/google/callback',
+  }
+  return {
+    clientId: process.env.MICROSOFT_CLIENT_ID,
+    clientSecret: process.env.MICROSOFT_CLIENT_SECRET,
+    authorizationEndpoint: `https://login.microsoftonline.com/${process.env.MICROSOFT_TENANT_ID || 'common'}/oauth2/v2.0/authorize`,
+    tokenEndpoint: `https://login.microsoftonline.com/${process.env.MICROSOFT_TENANT_ID || 'common'}/oauth2/v2.0/token`,
+    redirectUri: process.env.MICROSOFT_REDIRECT_URI || 'http://localhost:4000/api/auth/oauth/microsoft/callback',
+  }
+}
+
+app.get('/api/auth/oauth/:provider', (req, res) => {
+  const provider = req.params.provider === 'google' || req.params.provider === 'microsoft' ? req.params.provider : null
+  if (!provider) return res.status(404).json({ error: 'OAUTH_PROVIDER_NOT_FOUND' })
+  const config = oauthConfiguration(provider)
+  if (!config.clientId || !config.clientSecret) return res.status(503).json({ error: 'OAUTH_NOT_CONFIGURED' })
+  const state = createOAuthState(provider)
+  const params = new URLSearchParams({
+    client_id: config.clientId,
+    redirect_uri: config.redirectUri,
+    response_type: 'code',
+    scope: provider === 'google' ? 'openid email profile' : 'openid email profile User.Read',
+    state,
+    ...(provider === 'google' ? { hd: allowedDomains[0] } : {}),
+  })
+  return res.redirect(`${config.authorizationEndpoint}?${params}`)
+})
+
+app.get('/api/auth/oauth/:provider/callback', async (req, res, next) => {
+  const provider = req.params.provider === 'google' || req.params.provider === 'microsoft' ? req.params.provider : null
+  const code = typeof req.query.code === 'string' ? req.query.code : ''
+  const state = typeof req.query.state === 'string' ? req.query.state : ''
+  if (!provider || !code || !consumeOAuthState(state, provider)) return res.status(400).send('Недійсний або прострочений OAuth-запит.')
+  try {
+    const config = oauthConfiguration(provider)
+    if (!config.clientId || !config.clientSecret) return res.status(503).send('OAuth не налаштований.')
+    const tokenResponse = await fetch(config.tokenEndpoint, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ client_id: config.clientId, client_secret: config.clientSecret, code, redirect_uri: config.redirectUri, grant_type: 'authorization_code' }) })
+    if (!tokenResponse.ok) return res.status(401).send('Не вдалося підтвердити OAuth-код.')
+    const tokens = await tokenResponse.json() as { access_token?: string; id_token?: string }
+    if (!tokens.access_token) return res.status(401).send('OAuth-провайдер не повернув access token.')
+    const profileResponse = await fetch(provider === 'google' ? 'https://openidconnect.googleapis.com/v1/userinfo' : 'https://graph.microsoft.com/oidc/userinfo', { headers: { Authorization: `Bearer ${tokens.access_token}` } })
+    if (!profileResponse.ok) return res.status(401).send('Не вдалося отримати корпоративний профіль.')
+    const profile = await profileResponse.json() as { email?: string; preferred_username?: string; name?: string; sub?: string }
+    const email = (profile.email || profile.preferred_username || '').toLowerCase()
+    if (!email || !isAllowedCorporateEmail(email)) return res.status(403).send(`Дозволені лише корпоративні адреси: ${allowedDomains.join(', ')}.`)
+    const name = profile.name?.trim() || email.split('@')[0]
+    const existing = await pool.query<{ id: string }>('SELECT id FROM users WHERE email = $1', [email])
+    let userId = existing.rows[0]?.id
+    if (!userId) {
+      const created = await pool.query<{ id: string }>('INSERT INTO users (name, email, password_hash) VALUES ($1, $2, NULL) RETURNING id', [name, email])
+      userId = created.rows[0].id
+    }
+    await createSession(userId, res)
+    return res.redirect(process.env.WEB_ORIGIN || 'http://localhost:8080')
+  } catch (error) { return next(error) }
+})
+
 app.post('/api/auth/register', async (req, res, next) => {
+  if (!passwordLoginEnabled) return res.status(403).json({ error: 'PASSWORD_LOGIN_DISABLED' })
   try {
     const data = userSchema.parse(req.body)
     const passwordHash = await bcrypt.hash(data.password, 12)
@@ -64,10 +155,11 @@ app.post('/api/auth/register', async (req, res, next) => {
 })
 
 app.post('/api/auth/login', async (req, res, next) => {
+  if (!passwordLoginEnabled) return res.status(403).json({ error: 'PASSWORD_LOGIN_DISABLED' })
   try {
     const data = userSchema.pick({ email: true, password: true }).parse(req.body)
-    const result = await pool.query<{ id: string; name: string; email: string; password_hash: string }>('SELECT id, name, email, password_hash FROM users WHERE email = lower($1)', [data.email])
-    if (!result.rowCount || !(await bcrypt.compare(data.password, result.rows[0].password_hash))) return res.status(401).json({ error: 'INVALID_CREDENTIALS' })
+    const result = await pool.query<{ id: string; name: string; email: string; password_hash: string | null }>('SELECT id, name, email, password_hash FROM users WHERE email = lower($1)', [data.email])
+    if (!result.rowCount || !result.rows[0].password_hash || !(await bcrypt.compare(data.password, result.rows[0].password_hash))) return res.status(401).json({ error: 'INVALID_CREDENTIALS' })
     const token = crypto.randomBytes(32).toString('hex')
     await pool.query("INSERT INTO sessions (token, user_id, expires_at) VALUES ($1, $2, now() + interval '30 days')", [token, result.rows[0].id])
     res.cookie(authCookie, token, { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production', maxAge: sessionDays * 86400000 })
@@ -165,11 +257,12 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
 
 async function start() {
   await pool.query('CREATE EXTENSION IF NOT EXISTS pgcrypto')
-  await pool.query(`CREATE TABLE IF NOT EXISTS users (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), name text NOT NULL, email text NOT NULL UNIQUE, password_hash text NOT NULL, created_at timestamptz NOT NULL DEFAULT now());
+  await pool.query(`CREATE TABLE IF NOT EXISTS users (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), name text NOT NULL, email text NOT NULL UNIQUE, password_hash text, created_at timestamptz NOT NULL DEFAULT now());
     CREATE TABLE IF NOT EXISTS sessions (token text PRIMARY KEY, user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE, expires_at timestamptz NOT NULL);
     CREATE TABLE IF NOT EXISTS contacts (id bigserial PRIMARY KEY, user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE, name text NOT NULL, company text NOT NULL, email text NOT NULL, status text NOT NULL DEFAULT 'Нова', score integer NOT NULL DEFAULT 70, created_at timestamptz NOT NULL DEFAULT now());
     CREATE TABLE IF NOT EXISTS deals (id bigserial PRIMARY KEY, user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE, name text NOT NULL, company text NOT NULL, value numeric NOT NULL DEFAULT 0, stage text NOT NULL DEFAULT 'Кваліфікація', probability integer NOT NULL DEFAULT 20, updated_at timestamptz NOT NULL DEFAULT now());
-    CREATE TABLE IF NOT EXISTS tasks (id bigserial PRIMARY KEY, user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE, title text NOT NULL, due_at timestamptz NOT NULL, completed_at timestamptz);`)
+    CREATE TABLE IF NOT EXISTS tasks (id bigserial PRIMARY KEY, user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE, title text NOT NULL, due_at timestamptz NOT NULL, completed_at timestamptz);
+    ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL;`)
   const botLogger = new BotLogger()
   const automation = new AutomationEngine(async signal => botLogger.record(signal))
   setInterval(async () => {
